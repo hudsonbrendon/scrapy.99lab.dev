@@ -2,7 +2,7 @@ import httpx
 import json
 from fastapi import FastAPI, HTTPException
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 import uvicorn
 import random
 import asyncio
@@ -15,6 +15,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Instagram API", description="API for Instagram data retrieval")
+
+# Blacklisted proxies that returned 401 Unauthorized
+BLACKLISTED_PROXIES: Set[str] = set()
 
 # Cache proxies for 30 minutes to avoid excessive requests
 @lru_cache(maxsize=1)
@@ -40,8 +43,8 @@ async def fetch_proxies() -> List[str]:
             response.raise_for_status()
             
             # Parse the proxies (one per line in format IP:PORT)
-            proxies = [line.strip() for line in response.text.split('\n') if line.strip()]
-            logger.info(f"Fetched {len(proxies)} proxies")
+            proxies = [line.strip() for line in response.text.split('\n') if line.strip() and line.strip() not in BLACKLISTED_PROXIES]
+            logger.info(f"Fetched {len(proxies)} proxies (excluding {len(BLACKLISTED_PROXIES)} blacklisted)")
             
             # Update cache
             get_cached_proxies.cache_clear()
@@ -53,10 +56,12 @@ async def fetch_proxies() -> List[str]:
         return []
 
 def get_random_proxy() -> Optional[str]:
-    """Get a random proxy from the cached list"""
+    """Get a random proxy from the cached list, excluding blacklisted ones"""
     proxies = get_cached_proxies(int(datetime.now().timestamp() / 1800))
-    if proxies:
-        return random.choice(proxies)
+    # Filter out blacklisted proxies
+    available_proxies = [p for p in proxies if p not in BLACKLISTED_PROXIES]
+    if available_proxies:
+        return random.choice(available_proxies)
     return None
 
 async def make_request_with_proxy(url: str, headers: Dict[str, str], params: Dict[str, str] = None) -> Dict:
@@ -64,6 +69,7 @@ async def make_request_with_proxy(url: str, headers: Dict[str, str], params: Dic
     max_attempts = 3
     attempt = 0
     errors = []
+    used_proxies = []
     
     while attempt < max_attempts:
         proxy = get_random_proxy()
@@ -71,6 +77,7 @@ async def make_request_with_proxy(url: str, headers: Dict[str, str], params: Dic
         
         if proxy:
             proxy_url = f"http://{proxy}"
+            used_proxies.append(proxy)
             logger.info(f"Using proxy: {proxy}")
         else:
             logger.warning("No proxies available, making direct request")
@@ -85,13 +92,46 @@ async def make_request_with_proxy(url: str, headers: Dict[str, str], params: Dic
                 else:
                     response = await client.get(url, headers=headers)
                 
+                if response.status_code == 401:
+                    # Blacklist this proxy for 401 Unauthorized errors
+                    if proxy:
+                        logger.warning(f"Proxy {proxy} returned 401 Unauthorized, adding to blacklist")
+                        BLACKLISTED_PROXIES.add(proxy)
+                        errors.append(f"Proxy {proxy} returned 401 Unauthorized and has been blacklisted")
+                    else:
+                        errors.append("401 Unauthorized error without proxy")
+                    attempt += 1
+                    continue
+                
                 response.raise_for_status()
                 return response.json()
+                
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401 and proxy:
+                logger.warning(f"Proxy {proxy} returned 401 Unauthorized, adding to blacklist")
+                BLACKLISTED_PROXIES.add(proxy)
+                errors.append(f"Proxy {proxy} returned 401 Unauthorized and has been blacklisted")
+            else:
+                logger.warning(f"Request failed with proxy {proxy}: {str(e)}")
+                errors.append(str(e))
+            attempt += 1
         except Exception as e:
             logger.warning(f"Request failed with proxy {proxy}: {str(e)}")
             errors.append(str(e))
             attempt += 1
-            
+    
+    # If we only had 401 errors and we used proxies, return a custom 401 error
+    if all("401 Unauthorized" in error for error in errors) and used_proxies:
+        raise HTTPException(
+            status_code=401, 
+            detail={
+                "message": "Authentication failed with Instagram API",
+                "blacklisted_proxies": list(used_proxies),
+                "errors": errors
+            }
+        )
+    
+    # Otherwise return a generic 500 error
     raise HTTPException(status_code=500, detail=f"All requests failed after {max_attempts} attempts: {', '.join(errors)}")
 
 async def get_user_id(username: str) -> Dict[str, Any]:
@@ -113,6 +153,9 @@ async def get_user_id(username: str) -> Dict[str, Any]:
         # Use proxy-enabled request function
         data = await make_request_with_proxy(url, headers)
         return data["data"]
+    except HTTPException as e:
+        # Re-raise HTTPExceptions directly to preserve status code and detail
+        raise
     except (httpx.HTTPError, KeyError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=500, detail=f"Failed to get user data: {str(e)}")
 
