@@ -67,19 +67,19 @@ async def make_request_with_proxy(url: str, headers: Dict[str, str], params: Dic
     
     while attempt < max_attempts:
         proxy = get_random_proxy()
-        proxies = {}
+        proxy_url = None
         
         if proxy:
-            proxies = {
-                "http://": f"http://{proxy}",
-                "https://": f"http://{proxy}"
-            }
+            proxy_url = f"http://{proxy}"
             logger.info(f"Using proxy: {proxy}")
         else:
             logger.warning("No proxies available, making direct request")
         
         try:
-            async with httpx.AsyncClient(proxies=proxies) as client:
+            async with httpx.AsyncClient() as client:
+                if proxy_url:
+                    client.transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
+                
                 if params:
                     response = await client.get(url, headers=headers, params=params)
                 else:
